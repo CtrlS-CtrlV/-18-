@@ -1,0 +1,143 @@
+/* сервер телефонної книги */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include "phonebook.h"
+
+#define PORT 9400
+
+static PbEntry book[MAX_ENTRIES];
+static int book_count = 0;
+
+static ssize_t read_full(int fd, void *buf, size_t n)
+{
+    size_t total = 0;
+    while (total < n) {
+        ssize_t r = read(fd, (char *)buf + total, n - total);
+        if (r == -1) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) return (ssize_t)total;
+        total += r;
+    }
+    return (ssize_t)total;
+}
+
+static int send_response(int fd, uint8_t status, const void *data, uint16_t len)
+{
+    PbHeader hdr = { .command = status, .payload_len = htons(len) };
+    write(fd, &hdr, PB_HDR_SIZE);
+    if (len > 0 && data) {
+        write(fd, data, len);
+    }
+    return 0;
+}
+
+static void handle_add(int fd, const uint8_t *payload, uint16_t len)
+{
+    if (len < PB_NAME_LEN + PB_PHONE_LEN || book_count >= MAX_ENTRIES) {
+        send_response(fd, RSP_ERROR, NULL, 0);
+        return;
+    }
+    memcpy(book[book_count].name, payload, PB_NAME_LEN);
+    memcpy(book[book_count].phone, payload + PB_NAME_LEN, PB_PHONE_LEN);
+    book_count++;
+    send_response(fd, RSP_OK, NULL, 0);
+}
+
+static void handle_search(int fd, const uint8_t *payload, uint16_t len)
+{
+    char search_name[PB_NAME_LEN];
+    memset(search_name, 0, sizeof(search_name));
+    size_t copy_len = len < PB_NAME_LEN ? len : PB_NAME_LEN - 1;
+    memcpy(search_name, payload, copy_len);
+
+    for (int i = 0; i < book_count; i++) {
+        if (strcmp(book[i].name, search_name) == 0) {
+            send_response(fd, RSP_OK, &book[i], sizeof(PbEntry));
+            return;
+        }
+    }
+    send_response(fd, RSP_NOT_FOUND, NULL, 0);
+}
+
+static void handle_delete(int fd, const uint8_t *payload, uint16_t len)
+{
+    char del_name[PB_NAME_LEN];
+    memset(del_name, 0, sizeof(del_name));
+    size_t copy_len = len < PB_NAME_LEN ? len : PB_NAME_LEN - 1;
+    memcpy(del_name, payload, copy_len);
+
+    for (int i = 0; i < book_count; i++) {
+        if (strcmp(book[i].name, del_name) == 0) {
+            for (int j = i; j < book_count - 1; j++) {
+                book[j] = book[j + 1];
+            }
+            book_count--;
+            send_response(fd, RSP_OK, NULL, 0);
+            return;
+        }
+    }
+    send_response(fd, RSP_NOT_FOUND, NULL, 0);
+}
+
+static void handle_list(int fd)
+{
+    uint16_t net_count = htons((uint16_t)book_count);
+    size_t total_len = 2 + book_count * sizeof(PbEntry);
+    uint8_t *buf = malloc(total_len);
+
+    memcpy(buf, &net_count, 2);
+    if (book_count > 0) {
+        memcpy(buf + 2, book, book_count * sizeof(PbEntry));
+    }
+
+    send_response(fd, RSP_OK, buf, (uint16_t)total_len);
+    free(buf);
+}
+
+int main(void)
+{
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in srv;
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons(PORT);
+    srv.sin_addr.s_addr = INADDR_ANY;
+
+    bind(listen_fd, (struct sockaddr *)&srv, sizeof(srv));
+    listen(listen_fd, 5);
+
+    printf("Телефонна книга — сервер на порту %d\n", PORT);
+
+    int conn_fd = accept(listen_fd, NULL, NULL);
+
+    PbHeader hdr;
+    while (read_full(conn_fd, &hdr, PB_HDR_SIZE) == PB_HDR_SIZE) {
+        uint16_t plen = ntohs(hdr.payload_len);
+        uint8_t payload[1024];
+
+        if (plen > 0 && read_full(conn_fd, payload, plen) != plen)
+            break;
+
+        switch (hdr.command) {
+            case CMD_ADD:    handle_add(conn_fd, payload, plen);    break;
+            case CMD_SEARCH: handle_search(conn_fd, payload, plen); break;
+            case CMD_DELETE: handle_delete(conn_fd, payload, plen); break;
+            case CMD_LIST:   handle_list(conn_fd);                  break;
+            default:
+                send_response(conn_fd, RSP_ERROR, NULL, 0);
+        }
+    }
+
+    close(conn_fd);
+    close(listen_fd);
+    return EXIT_SUCCESS;
+}
